@@ -1,0 +1,3 @@
+[nostr_mcp]
+private_key = "<your-hex-private-key-here>"
+relays = ["wss://jellyfish.land", "wss://nostr.land"]
