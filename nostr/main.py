@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from mcp.server.fastmcp import FastMCP, Context
 from nostr.key import PrivateKey
 from nostr.relay_manager import RelayManager
-from nostr.filter import FiltersList, Filter
+from nostr.filter import Filters
 from nostr.event import Event
 import toml
-from typing import List, Union
+from typing import List
 import uuid
 
 
@@ -84,7 +84,7 @@ def publish_nostr_event(
 
 
 @mcp.tool()
-def fetch_nostr_events(filters: Union[Filter, List[Filter]]) -> List[Event]:
+def fetch_nostr_events(filters: Filters) -> List[Event]:
     """
     Subscribe to relays using standard Nostr filters (NIP‑01) and return matching Event objects.
 
@@ -118,21 +118,24 @@ def fetch_nostr_events(filters: Union[Filter, List[Filter]]) -> List[Event]:
     ctx: Context = mcp.get_context()
     app_ctx = ctx.request_context.lifespan_context
 
-    fltr_list = FiltersList(filters if isinstance(filters, list) else [filters])
     sub_id = uuid.uuid4().hex
-    rm = app_ctx.relay_manager
+    rm: RelayManager = app_ctx.relay_manager
 
-    rm.add_subscription_on_all_relays(sub_id, fltr_list)
-    rm.run_sync(timeout=2)
+    rm.add_subscription(sub_id, filters)
 
     events: List[Event] = []
     pool = rm.message_pool
     while pool.has_events():
-        ev_msg = pool.get_event()
-        events.append(ev_msg.event)
+        ev: Event = pool.get_event().event
+        if not ev.verify():
+            continue
+
+        if not filters.match(ev):
+            continue
+            
+        events.append(ev.event)
 
     return events
-
 
 @mcp.tool()
 def get_nostr_pubkey() -> str:
