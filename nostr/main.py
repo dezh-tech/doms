@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+import httpx
 from mcp.server.fastmcp import FastMCP, Context
 from nostr.key import PrivateKey
 from nostr.relay_manager import RelayManager
@@ -132,10 +133,11 @@ def fetch_nostr_events(filters: Filters) -> List[Event]:
 
         if not filters.match(ev):
             continue
-            
+
         events.append(ev.event)
 
     return events
+
 
 @mcp.tool()
 def get_nostr_pubkey() -> str:
@@ -167,3 +169,73 @@ def list_nostr_relays() -> List[str]:
     ctx: Context = mcp.get_context()
     app_ctx = ctx.request_context.lifespan_context
     return list(app_ctx.relay_manager.relays.keys())
+
+
+@mcp.tool()
+async def get_nip(ctx: Context[AppContext], nip_id: str) -> str:
+    """
+    Fetches the content of a specified Nostr Implementation Possibility (NIP), returning its full markdown text.
+
+    NIP IDs follow the pattern:
+      - Numeric NIPs: e.g., "01", "07" — always zero-padded to two digits.
+      - Alphanumeric NIPs (Hexadecimal): e.g., "CC", "7D".
+
+    Parameters:
+        nip_id (str): The NIP identifier (zero-padded number or uppercase alphanumeric),
+                      e.g. "01", "07", "7D", "CC".
+
+    Returns:
+        str: Full markdown text of the NIP document.
+
+    Context:
+      NIPs ("Nostr Implementation Possibilities") are specifications that define possible features or behaviors
+      in Nostr-compatible software. This tool helps the you retrieve and understand
+      protocol standards dynamically.
+    """
+    url = f"https://raw.githubusercontent.com/nostr-protocol/nips/master/{nip_id}.md"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url)
+    resp.raise_for_status()
+    return resp.text
+
+
+@mcp.tool()
+async def connect_relay(ctx: Context[AppContext], relay_url: str) -> bool:
+    """
+    Dynamically connects the running server to an additional Nostr relay.
+
+    Parameters:
+        relay_url (str): WebSocket URL of the relay to connect, e.g. "wss://relay.example.com".
+
+    Returns:
+        bool: True if the connection was successfully established, False otherwise.
+
+    Behavior:
+      Adds and connects to the given relay URL via `RelayManager`.
+    """
+    ctx.app.relay_manager.add_relay(relay_url)
+    ctx.app.relay_manager.open_connections()
+    return relay_url in ctx.app.relay_manager.connection_statuses
+
+
+@mcp.tool()
+async def relay_info(ctx: Context[AppContext], relay_url: str) -> dict:
+    """
+    Retrieves metadata from a Nostr relay using NIP-11 (Relay Information Document).
+
+    Parameters:
+        relay_url (str): The WebSocket URL of the relay (e.g., "wss://relay.example.com").
+
+    Returns:
+        dict: Parsed NIP-11 metadata
+
+    Context:
+      NIP-11 defines a JSON document available via HTTP(S) (same host as the WebSocket relay) that describes
+      relay capabilities—such as supported NIPs, software version, contact info and more.
+    """
+    http_url = relay_url.replace("ws://", "http://").replace("wss://", "https://")
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(http_url, headers={"Accept": "application/nostr+json"})
+        resp.raise_for_status()
+        info = resp.json()
+    return info

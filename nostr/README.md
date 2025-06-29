@@ -11,6 +11,4 @@ Current available tools:
 
 Possible improvements:
 
-- `get_nip` tool: gets content of an NIP by its number so the agent can read and understand it.
-- `connect_relay` too: connects to provided relay.
 - AUTH message handle: sends auth if it was required.
