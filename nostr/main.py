@@ -213,9 +213,36 @@ async def connect_relay(ctx: Context[AppContext], relay_url: str) -> bool:
     Behavior:
       Adds and connects to the given relay URL via `RelayManager`.
     """
+    rm: RelayManager = ctx.app.relay_manager
+    if relay_url in rm.relays:
+        return True
+    
     ctx.app.relay_manager.add_relay(relay_url)
     ctx.app.relay_manager.open_connections()
     return relay_url in ctx.app.relay_manager.connection_statuses
+
+@mcp.tool()
+async def disconnect_relay(ctx: Context[AppContext], relay_url: str) -> bool:
+    """
+    Disconnects from a specified Nostr relay at runtime.
+
+    Parameters:
+        relay_url (str): WebSocket URL of the relay to disconnect, e.g. "wss://relay.example.com".
+
+    Returns:
+        bool: True if the relay was found and disconnected successfully, False otherwise.
+
+    Behavior:
+      Closes the WebSocket connection via RelayManager and removes its entry, allowing the server 
+      to dynamically manage its relay set.
+    """
+    rm: RelayManager = ctx.app.relay_manager
+    if relay_url not in rm.relays:
+        return False
+
+    rm.close_relay(relay_url)
+    removed = relay_url not in rm.connection_statuses or not rm.connection_statuses.get(relay_url, True)
+    return removed
 
 
 @mcp.tool()
