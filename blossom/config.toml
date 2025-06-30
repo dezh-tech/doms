@@ -1,0 +1,6 @@
+[blossom]
+base_url = "https://my.blossom.server"
+relays = [ "wss://relay.nostr.info"]
+
+[nostr]
+private_key = "..."
