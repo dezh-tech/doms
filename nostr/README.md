@@ -16,3 +16,4 @@ Current available tools:
 Possible improvements:
 
 - AUTH message handle: sends auth if it was required.
+- NIP-19 entities encode/decode tool.

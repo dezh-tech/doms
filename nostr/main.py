@@ -1,15 +1,16 @@
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+import json
+from typing import List, Dict, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP, Context
 from nostr.key import PrivateKey
 from nostr.relay_manager import RelayManager
-from nostr.filter import Filters
+from nostr.filter import Filters, Filter
 from nostr.event import Event
 import toml
-from typing import List
 import uuid
 
 
@@ -21,16 +22,25 @@ class AppContext:
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
-    config = toml.load("config.toml")
-    privkey = PrivateKey.from_hex(config["nostr"]["private_key"])
-    relay_manager = RelayManager()
-    for url in config["nostr"]["relays"]:
-        relay_manager.add_relay(url)
-    relay_manager.open_connections()
+    relay_manager = None
     try:
+        config = toml.load("config.toml")
+        privkey = PrivateKey.from_nsec(config["nostr"]["private_key"])
+        relay_manager = RelayManager()
+        for url in config["nostr"]["relays"]:
+            relay_manager.add_relay(url)
+        relay_manager.open_connections()
+
         yield AppContext(privkey=privkey, relay_manager=relay_manager)
+    except Exception as e:
+        print(f"Error in app_lifespan: {e}")
+        raise
     finally:
-        relay_manager.close_connections()
+        if relay_manager:
+            try:
+                relay_manager.close_connections()
+            except Exception as e:
+                print(f"Error closing connections: {e}")
 
 
 mcp = FastMCP("Nostr MCP Server", lifespan=app_lifespan)
@@ -38,12 +48,12 @@ mcp = FastMCP("Nostr MCP Server", lifespan=app_lifespan)
 
 @mcp.tool()
 def publish_nostr_event(
-    content: str, kind: int = 1, tags: list[str] | None = None
+    content: str, kind: int = 1, tags: list[list[str]] | None = None
 ) -> str:
     """
     Publish a Nostr event (per NIP‑01) to configured relays.
 
-    Nostr (“Notes and Other Stuff Transmitted by Relays”) is a simple,
+    Nostr ("Notes and Other Stuff Transmitted by Relays") is a simple,
     censorship‑resistant protocol where each client holds an EC key pair
     and signs JSON events (per NIP‑01) before sending them to relays.
 
@@ -52,19 +62,19 @@ def publish_nostr_event(
       - `pubkey`: hex‑encoded secp256-k1 public key of the author
       - `created_at`: UNIX timestamp in seconds
       - `kind`: integer indicating event type between 0 and 65535 (e.g., 1 = short text note)
-      - `tags`: list of tag arrays (e.g., ["e", <event‑id>], ["p", <pubkey>])
+      - `tags`: list of tag arrays (e.g., [["e", "<event‑id>"], ["p", "<pubkey>"]])
       - `content`: arbitrary string
       - `sig`: Schnorr signature of the event hash
 
     This function:
       1. Constructs an event with `content`, `kind`, and optional `tags`
-      2. Uses the server’s configured private key to compute `id` and `sig`
+      2. Uses the server's configured private key to compute `id` and `sig`
       3. Publishes the signed event to all configured relays
 
     Args:
         content (str): the text or JSON content of the event
         kind (int, optional): Nostr event kind (defaults to 1 = short text note)
-        tags (list[str], optional): list of Nostr tags (arrays of strings),
+        tags (list[list[str]], optional): list of Nostr tags (arrays of strings),
             e.g. `[["e", "<event‑id>"], ["p", "<pubkey>"]]`
 
     Returns:
@@ -85,7 +95,16 @@ def publish_nostr_event(
 
 
 @mcp.tool()
-def fetch_nostr_events(filters: Filters) -> List[Event]:
+def fetch_nostr_events(
+    ids: Optional[List[str]] = None,
+    authors: Optional[List[str]] = None,
+    kinds: Optional[List[int]] = None,
+    since: Optional[int] = None,
+    until: Optional[int] = None,
+    limit: Optional[int] = None,
+    search: Optional[str] = None,
+    tags: Optional[Dict[str, List[str]]] = None,
+) -> List[str]:
     """
     Subscribe to relays using standard Nostr filters (NIP‑01) and return matching Event objects.
 
@@ -93,56 +112,106 @@ def fetch_nostr_events(filters: Filters) -> List[Event]:
       - `ids`: list of exact 64-char event IDs
       - `authors`: list of lowercase pubkeys
       - `kinds`: list of event kind integers
-      - `#<tag>`: tag-based filters (e.g. `#e`, `#p`) for matching tag values
+      - `tags`: dict of tag-based filters (e.g. {"e": ["event_id"], "p": ["pubkey"]})
       - `since`, `until`: UNIX timestamps (inclusive) for event creation time
       - `limit`: maximum number of events returned in the initial batch
       - `search`: full-text search query
 
     Matching rules:
-      - For arrays (`ids`, `authors`, `kinds`, `#e`, etc.), at least one element must match
+      - For arrays (`ids`, `authors`, `kinds`, tag values), at least one element must match
       - `since ≤ created_at ≤ until`
       - Multiple filters = logical OR; within a filter = logical AND
 
-    This tool:
-      1. Accepts one or more `Filter` instances from `python-nostr`
-      2. Sends a subscription (`REQ`) to all configured relays
-      3. Waits briefly to collect both stored and live events
-      4. Returns a list of `nostr.event.Event` instances
-
     Args:
-        filters (Filter or list[Filter]): Pre-built filter(s) using `nostr.filter.Filter`,
-            e.g. `Filter().authors([pubkey]).kinds([1]).since(ts).limit(50)`
+        ids (Optional[List[str]]): list of event IDs to match
+        authors (Optional[List[str]]): list of author pubkeys to match
+        kinds (Optional[List[int]]): list of event kinds to match
+        since (Optional[int]): earliest timestamp (inclusive)
+        until (Optional[int]): latest timestamp (inclusive)
+        limit (Optional[int]): maximum number of events to return
+        search (Optional[str]): full-text search query
+        tags (Optional[Dict[str, List[str]]]): tag filters, e.g. {"e": ["event_id"], "p": ["pubkey"]}
 
     Returns:
-        List[nostr.event.Event]: Fully parsed Event objects matching the filter criteria.
+        List[str]: JSON-serialized Event objects matching the filter criteria.
     """
-    ctx: Context = mcp.get_context()
-    app_ctx = ctx.request_context.lifespan_context
+    try:
+        ctx: Context = mcp.get_context()
+        app_ctx = ctx.request_context.lifespan_context
 
-    sub_id = uuid.uuid4().hex
-    rm: RelayManager = app_ctx.relay_manager
+        filter_obj = Filter()
+        if ids:
+            filter_obj = filter_obj.ids(ids)
+        if authors:
+            filter_obj = filter_obj.authors(authors)
+        if kinds:
+            filter_obj = filter_obj.kinds(kinds)
+        if since:
+            filter_obj = filter_obj.since(since)
+        if until:
+            filter_obj = filter_obj.until(until)
+        if limit:
+            filter_obj = filter_obj.limit(limit)
+        if search:
+            filter_obj = filter_obj.search(search)
 
-    rm.add_subscription(sub_id, filters)
+        if tags:
+            for tag_name, tag_values in tags.items():
+                setattr(filter_obj, f"#{tag_name}", tag_values)
 
-    events: List[Event] = []
-    pool = rm.message_pool
-    while pool.has_events():
-        ev: Event = pool.get_event().event
-        if not ev.verify():
-            continue
+        filters = Filters([filter_obj])
 
-        if not filters.match(ev):
-            continue
+        sub_id = uuid.uuid4().hex
+        rm: RelayManager = app_ctx.relay_manager
 
-        events.append(ev.event)
+        rm.add_subscription(sub_id, filters)
 
-    return events
+        events: List[Event] = []
+        pool = rm.message_pool
+
+        import time
+
+        time.sleep(1)
+
+        while pool.has_events():
+            try:
+                ev_msg = pool.get_event()
+                ev: Event = ev_msg.event
+                if not ev.verify():
+                    continue
+
+                if not filters.match(ev):
+                    continue
+
+                events.append(ev)
+            except Exception as e:
+                print(f"Error processing event: {e}")
+                continue
+
+        return [
+            json.dumps(
+                {
+                    "id": ev.id,
+                    "pubkey": ev.public_key,
+                    "created_at": ev.created_at,
+                    "kind": ev.kind,
+                    "tags": ev.tags,
+                    "content": ev.content,
+                    "sig": ev.signature,
+                },
+                indent=4,
+            )
+            for ev in events
+        ]
+    except Exception as e:
+        print(f"Error in fetch_nostr_events: {e}")
+        return []
 
 
 @mcp.tool()
 def get_nostr_pubkey() -> str:
     """
-    Return the hex-encoded public key corresponding to the server’s private key.
+    Return the hex-encoded public key corresponding to the server's private key.
 
     In Nostr, identity is determined by a secp256k1 key pair. The public key (hex)
     is used to identify the author of events.
@@ -172,7 +241,7 @@ def list_nostr_relays() -> List[str]:
 
 
 @mcp.tool()
-async def get_nip(ctx: Context[AppContext], nip_id: str) -> str:
+async def get_nip(nip_id: str) -> str:
     """
     Fetches the content of a specified Nostr Implementation Possibility (NIP), returning its full markdown text.
 
@@ -189,7 +258,7 @@ async def get_nip(ctx: Context[AppContext], nip_id: str) -> str:
 
     Context:
       NIPs ("Nostr Implementation Possibilities") are specifications that define possible features or behaviors
-      in Nostr-compatible software. This tool helps the you retrieve and understand
+      in Nostr-compatible software. This tool helps retrieve and understand
       protocol standards dynamically.
     """
     url = f"https://raw.githubusercontent.com/nostr-protocol/nips/master/{nip_id}.md"
@@ -200,7 +269,7 @@ async def get_nip(ctx: Context[AppContext], nip_id: str) -> str:
 
 
 @mcp.tool()
-async def connect_relay(ctx: Context[AppContext], relay_url: str) -> bool:
+def connect_relay(relay_url: str) -> bool:
     """
     Dynamically connects the running server to an additional Nostr relay.
 
@@ -213,16 +282,20 @@ async def connect_relay(ctx: Context[AppContext], relay_url: str) -> bool:
     Behavior:
       Adds and connects to the given relay URL via `RelayManager`.
     """
-    rm: RelayManager = ctx.app.relay_manager
+    ctx: Context = mcp.get_context()
+    app_ctx = ctx.request_context.lifespan_context
+    rm: RelayManager = app_ctx.relay_manager
+
     if relay_url in rm.relays:
         return True
-    
-    ctx.app.relay_manager.add_relay(relay_url)
-    ctx.app.relay_manager.open_connections()
-    return relay_url in ctx.app.relay_manager.connection_statuses
+
+    rm.add_relay(relay_url)
+    rm.open_connections()
+    return relay_url in rm.connection_statuses
+
 
 @mcp.tool()
-async def disconnect_relay(ctx: Context[AppContext], relay_url: str) -> bool:
+def disconnect_relay(relay_url: str) -> bool:
     """
     Disconnects from a specified Nostr relay at runtime.
 
@@ -233,20 +306,25 @@ async def disconnect_relay(ctx: Context[AppContext], relay_url: str) -> bool:
         bool: True if the relay was found and disconnected successfully, False otherwise.
 
     Behavior:
-      Closes the WebSocket connection via RelayManager and removes its entry, allowing the server 
+      Closes the WebSocket connection via RelayManager and removes its entry, allowing the server
       to dynamically manage its relay set.
     """
-    rm: RelayManager = ctx.app.relay_manager
+    ctx: Context = mcp.get_context()
+    app_ctx = ctx.request_context.lifespan_context
+    rm: RelayManager = app_ctx.relay_manager
+
     if relay_url not in rm.relays:
         return False
 
     rm.close_relay(relay_url)
-    removed = relay_url not in rm.connection_statuses or not rm.connection_statuses.get(relay_url, True)
+    removed = relay_url not in rm.connection_statuses or not rm.connection_statuses.get(
+        relay_url, True
+    )
     return removed
 
 
 @mcp.tool()
-async def relay_info(ctx: Context[AppContext], relay_url: str) -> dict:
+async def relay_info(relay_url: str) -> str:
     """
     Retrieves metadata from a Nostr relay using NIP-11 (Relay Information Document).
 
@@ -254,7 +332,7 @@ async def relay_info(ctx: Context[AppContext], relay_url: str) -> dict:
         relay_url (str): The WebSocket URL of the relay (e.g., "wss://relay.example.com").
 
     Returns:
-        dict: Parsed NIP-11 metadata
+        str: NIP-11 metadata as JSON string
 
     Context:
       NIP-11 defines a JSON document available via HTTP(S) (same host as the WebSocket relay) that describes
@@ -265,4 +343,8 @@ async def relay_info(ctx: Context[AppContext], relay_url: str) -> dict:
         resp = await client.get(http_url, headers={"Accept": "application/nostr+json"})
         resp.raise_for_status()
         info = resp.json()
-    return info
+    return json.dumps(info, indent=4)
+
+
+if __name__ == "__main__":
+    mcp.run()
